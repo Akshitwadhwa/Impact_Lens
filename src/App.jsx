@@ -59,7 +59,27 @@ function explainCloudinaryError(message) {
 
 function formatPlace(value) {
   if (!value || /confirm|unknown/i.test(String(value))) return "Location unconfirmed";
-  return value;
+  const match = String(value).match(/(\d+)\s*deg\s*(\d+)'\s*([\d.]+)"\s*([NS]).*?(\d+)\s*deg\s*(\d+)'\s*([\d.]+)"\s*([EW])/i);
+  if (!match) return value;
+  const lat = Number(match[1]) + Number(match[2]) / 60 + Number(match[3]) / 3600;
+  const lng = Number(match[5]) + Number(match[6]) / 60 + Number(match[7]) / 3600;
+  return `${lat.toFixed(4)}° ${match[4].toUpperCase()}, ${lng.toFixed(4)}° ${match[8].toUpperCase()}`;
+}
+
+function assetTitle(asset) {
+  const name = String(asset.originalFilename || "").replace(/\.[^.]+$/, "");
+  if (!name || /^file_[a-z0-9]+$/i.test(name)) return asset.resourceType === "video" ? "Field video" : "Field photo";
+  return asset.originalFilename;
+}
+
+function groupByDate(assets) {
+  const groups = new Map();
+  assets.forEach((asset) => {
+    const label = formatWhen(asset.date);
+    if (!groups.has(label)) groups.set(label, []);
+    groups.get(label).push(asset);
+  });
+  return [...groups.entries()];
 }
 
 function makeFolders(files) {
@@ -92,6 +112,7 @@ function App() {
   const [intakeResult, setIntakeResult] = useState(null);
   const [reviewAssets, setReviewAssets] = useState([]);
   const [pair, setPair] = useState({ before: null, after: null });
+  const [libraryProject, setLibraryProject] = useState("");
   const inputRef = useRef(null);
 
   useEffect(() => {
@@ -100,6 +121,20 @@ function App() {
       .then((data) => setCloudinaryReady(Boolean(data.cloudinaryReady)))
       .catch(() => setCloudinaryReady(false));
   }, []);
+
+  useEffect(() => {
+    if (screen === "dashboard") loadProjects();
+  }, [screen]);
+
+  async function loadProjects() {
+    try {
+      const response = await fetch("/api/projects");
+      const data = await response.json();
+      if (response.ok) setProjects(data.projects || []);
+    } catch {
+      setNotice("Could not load saved projects.");
+    }
+  }
 
   const totals = useMemo(
     () => ({
@@ -130,7 +165,7 @@ function App() {
     setFolders((current) => current.map((folder) => (folder.id === id ? { ...folder, ...update } : folder)));
   }
 
-  async function uploadFolder(folder) {
+  async function uploadFolder(folder, eventId) {
     if (!profile) {
       setNotice("Create the event profile before starting an upload.");
       return;
@@ -143,6 +178,7 @@ function App() {
       body.append("profile", JSON.stringify(profile));
       body.append("sourceFolder", folder.name);
       body.append("folderBrief", folder.prompt);
+      body.append("eventId", String(eventId));
       const response = await fetch("/api/upload", { method: "POST", body });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "Upload failed");
@@ -163,10 +199,17 @@ function App() {
     }
     setIntakeState("uploading");
     try {
+      const eventResponse = await fetch("/api/events", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(profile)
+      });
+      const eventData = await eventResponse.json();
+      if (!eventResponse.ok) throw new Error(eventData.error || "Could not save the event.");
       let uploaded = 0;
       const assets = [];
       for (const folder of folders) {
-        const result = await uploadFolder(folder);
+        const result = await uploadFolder(folder, eventData.id);
         uploaded += result.uploaded;
         assets.push(...(result.assets || []));
       }
@@ -179,25 +222,10 @@ function App() {
     }
   }
 
-  function addProjectToDashboard() {
-    if (!profile) return;
-    const assets = intakeResult?.uploaded || folders.reduce((total, folder) => total + (folder.uploaded || folder.files.length), 0);
-    setProjects((current) => [
-      {
-        id: String(Date.now()),
-        name: profile.projectName,
-        location: profile.location,
-        progress: folders.some((folder) => folder.status === "ready" || folder.status === "uploading") ? 55 : 78,
-        assets,
-        events: 1,
-        color: "coral",
-        status: "Evidence intake",
-        date: "Created just now"
-      },
-      ...current
-    ]);
+  async function addProjectToDashboard() {
+    await loadProjects();
     setScreen("dashboard");
-    setNotice(`${profile.projectName} is now on your dashboard.`);
+    setNotice(profile ? `${profile.projectName} is saved in the library.` : "Projects loaded from the library.");
   }
 
   function assignPair(role, asset) {
@@ -248,7 +276,7 @@ function App() {
           </button>
           <button className="nav-item"><span>▦</span> Projects <em>{projects.length}</em></button>
           <button className="nav-item"><span>⌖</span> Evidence map</button>
-          <button className={screen === "library" || screen === "compare" ? "nav-item active" : "nav-item"} onClick={() => setScreen("library")}>
+          <button className={screen === "library" || screen === "compare" ? "nav-item active" : "nav-item"} onClick={() => { setLibraryProject(""); setScreen("library"); }}>
             <span>◫</span> Media library
           </button>
         </nav>
@@ -261,18 +289,18 @@ function App() {
 
       <section className="content">
         <header className="topbar">
-          <div><p className="eyebrow">SUSTAINABILITY MEDIA INTELLIGENCE</p><h1>{screen === "dashboard" ? "Your evidence workspace." : screen === "review" ? "Evidence review." : screen === "library" ? "Search field evidence." : screen === "compare" ? "Show the change." : "Create an evidence intake."}</h1></div>
+          <div><p className="eyebrow">SUSTAINABILITY MEDIA INTELLIGENCE</p><h1>{screen === "dashboard" ? "Your evidence workspace." : screen === "review" ? "Evidence review." : screen === "library" ? (libraryProject || "Search field evidence.") : screen === "compare" ? "Show the change." : "Create an evidence intake."}</h1></div>
           {screen === "dashboard" ? <button className="primary" onClick={() => setScreen("intake")}> <span>{icons.spark}</span> New intake</button> : <button className="ghost" onClick={() => setScreen(screen === "compare" ? "library" : "dashboard")}>{screen === "compare" ? "← Library" : "← Dashboard"}</button>}
         </header>
 
         {notice && <div className="notice"><span>{icons.spark}</span>{notice}<button onClick={() => setNotice("")}>×</button></div>}
 
         {screen === "dashboard" ? (
-          <Dashboard totals={totals} projects={projects} onNew={() => setScreen("intake")} />
+          <Dashboard totals={totals} projects={projects} onNew={() => setScreen("intake")} onOpen={(project) => { setLibraryProject(project.name); setScreen("library"); }} onViewAll={() => { setLibraryProject(""); setScreen("library"); }} />
         ) : screen === "review" ? (
           <EvidenceWorkspace result={intakeResult} folders={folders} assets={reviewAssets} onDashboard={addProjectToDashboard} onLibrary={() => setScreen("library")} onCompare={() => setScreen("compare")} onAssign={assignPair} onReviewTag={reviewTag} />
         ) : screen === "library" ? (
-          <MediaLibrary pair={pair} onAssign={assignPair} onCompare={() => setScreen("compare")} onReviewTag={reviewTag} onNotice={setNotice} />
+          <MediaLibrary key={libraryProject || "all"} projectName={libraryProject} pair={pair} onAssign={assignPair} onCompare={() => setScreen("compare")} onReviewTag={reviewTag} onNotice={setNotice} />
         ) : screen === "compare" ? (
           <CompareView pair={pair} onLibrary={() => setScreen("library")} />
         ) : (
@@ -294,7 +322,7 @@ function App() {
   );
 }
 
-function Dashboard({ totals, projects, onNew }) {
+function Dashboard({ totals, projects, onNew, onOpen, onViewAll }) {
   return <div className="dashboard fade-in">
     <section className="hero-card">
       <div className="hero-copy"><span className="mini-pill">FIELD MEDIA, MADE USEFUL</span><h2>Turn scattered evidence into <i>impact stories.</i></h2><p>Describe an event, import folders from a hard drive, and let your team review AI-ready media evidence in one place.</p><button className="primary" onClick={onNew}>Start an evidence intake <span>{icons.arrow}</span></button></div>
@@ -305,8 +333,8 @@ function Dashboard({ totals, projects, onNew }) {
       <Metric label="Evidence assets" value={totals.assets.toLocaleString()} icon="▧" accent="lime" note="Uploaded and indexed" />
       <Metric label="Verified events" value={totals.events} icon="✓" accent="violet" note="Ready for review" />
     </section>
-    <section className="section-heading"><div><p className="eyebrow">ACTIVE PROJECTS</p><h2>Evidence in motion</h2></div><button className="text-button">View all projects {icons.arrow}</button></section>
-    <section className="project-grid">{projects.length ? projects.map((project) => <ProjectCard project={project} key={project.id} />) : <div className="empty-projects"><span>◌</span><div><strong>No active projects yet</strong><p>Create your first evidence intake to begin organizing field media.</p></div><button className="outline" onClick={onNew}>Create intake</button></div>}</section>
+    <section className="section-heading"><div><p className="eyebrow">ACTIVE PROJECTS</p><h2>Evidence in motion</h2></div><button className="text-button" onClick={onViewAll}>View all projects {icons.arrow}</button></section>
+    <section className="project-grid">{projects.length ? projects.map((project) => <ProjectCard project={project} key={project.id} onOpen={onOpen} />) : <div className="empty-projects"><span>◌</span><div><strong>No active projects yet</strong><p>Create your first evidence intake to begin organizing field media.</p></div><button className="outline" onClick={onNew}>Create intake</button></div>}</section>
   </div>;
 }
 
@@ -314,8 +342,11 @@ function Metric({ label, value, icon, accent, note }) {
   return <article className={`metric-card ${accent}`}><div className="metric-icon">{icon}</div><p>{label}</p><strong>{value}</strong><small>{note}</small></article>;
 }
 
-function ProjectCard({ project }) {
-  return <article className={`project-card ${project.color}`}><div className="project-visual"><span className="visual-ring"></span><span className="visual-leaf">✦</span><div className="project-status">{project.status === "Review needed" ? "!" : "●"} {project.status}</div></div><div className="project-info"><p className="location">{icons.location} {project.location}</p><h3>{project.name}</h3><div className="project-stats"><span>{icons.media} {project.assets} assets</span><span>{icons.event} {project.events} events</span></div><div className="progress-line"><span style={{ width: `${project.progress}%` }}></span></div><footer><small>{project.date}</small><button>Open project {icons.arrow}</button></footer></div></article>;
+function ProjectCard({ project, onOpen }) {
+  return <article className={`project-card ${project.color}`} onClick={() => onOpen(project)} onKeyDown={(event) => { if (event.key === "Enter") onOpen(project); }} role="link" tabIndex={0}>
+    <div className="project-visual"><span className="visual-ring"></span><span className="visual-leaf">✦</span><div className="project-status">{project.status === "Review needed" ? "!" : "●"} {project.status}</div></div>
+    <div className="project-info"><p className="location">{icons.location} {formatPlace(project.location)}</p><h3>{project.name}</h3><div className="project-stats"><span>{icons.media} {project.assets} assets</span><span>{icons.event} {project.events} events</span></div><div className="progress-line"><span style={{ width: `${project.progress}%` }}></span></div><footer><small>{project.date}</small><button onClick={(event) => { event.stopPropagation(); onOpen(project); }}>Open project {icons.arrow}</button></footer></div>
+  </article>;
 }
 
 function Intake({ brief, setBrief, profile, createProfile, folders, inputRef, onFolderSelect, cloudinaryReady, intakeState, startIntake }) {
@@ -389,14 +420,15 @@ function SuggestionCard({ asset, onAssign, onReviewTag }) {
   </article>;
 }
 
-function MediaLibrary({ pair, onAssign, onCompare, onReviewTag, onNotice }) {
-  const [filters, setFilters] = useState({ q: "", project: "", tag: "", from: "", to: "", review: false });
+function MediaLibrary({ projectName = "", pair, onAssign, onCompare, onReviewTag, onNotice }) {
+  const [filters, setFilters] = useState({ q: "", project: projectName, tag: "", from: "", to: "", review: false, kind: "" });
   const [draft, setDraft] = useState(filters);
   const [assets, setAssets] = useState([]);
   const [total, setTotal] = useState(0);
   const [cursor, setCursor] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [selectedId, setSelectedId] = useState("");
 
   const load = useMemo(() => async (nextFilters, nextCursor = "", append = false) => {
     setLoading(true);
@@ -408,6 +440,7 @@ function MediaLibrary({ pair, onAssign, onCompare, onReviewTag, onNotice }) {
     if (nextFilters.from) params.set("from", nextFilters.from);
     if (nextFilters.to) params.set("to", nextFilters.to);
     if (nextFilters.review) params.set("review", "1");
+    if (nextFilters.kind) params.set("kind", nextFilters.kind);
     if (nextCursor) params.set("cursor", nextCursor);
     try {
       const response = await fetch(`/api/library?${params.toString()}`);
@@ -433,6 +466,14 @@ function MediaLibrary({ pair, onAssign, onCompare, onReviewTag, onNotice }) {
     setFilters(draft);
   }
 
+  function applyFilters(next) {
+    setDraft(next);
+    setFilters(next);
+  }
+
+  const selectedIndex = assets.findIndex((asset) => asset.publicId === selectedId);
+  const selected = selectedIndex >= 0 ? assets[selectedIndex] : null;
+
   async function decide(asset, signal, action) {
     try {
       const updated = await onReviewTag(asset, signal, action);
@@ -444,22 +485,31 @@ function MediaLibrary({ pair, onAssign, onCompare, onReviewTag, onNotice }) {
 
   return <div className="library fade-in">
     <form className="library-toolbar" onSubmit={search}>
-      <label>Search<input value={draft.q} onChange={(event) => setDraft({ ...draft, q: event.target.value })} placeholder="cleanup, shoreline, volunteers…" /></label>
+      <label className="search-field">Search<input value={draft.q} onChange={(event) => setDraft({ ...draft, q: event.target.value })} placeholder="place, tag, or file name" /></label>
       <label>Project<input value={draft.project} onChange={(event) => setDraft({ ...draft, project: event.target.value })} placeholder="Project name" /></label>
-      <label>Tag<input value={draft.tag} onChange={(event) => setDraft({ ...draft, tag: event.target.value })} placeholder="waste" /></label>
       <label>From<input type="date" value={draft.from} onChange={(event) => setDraft({ ...draft, from: event.target.value })} /></label>
       <label>To<input type="date" value={draft.to} onChange={(event) => setDraft({ ...draft, to: event.target.value })} /></label>
-      <label className="check-field"><input type="checkbox" checked={draft.review} onChange={(event) => setDraft({ ...draft, review: event.target.checked })} />Needs review</label>
       <button className="primary" type="submit">Search</button>
     </form>
+    <div className="library-chips">
+      {[["", "All"], ["image", "Photos"], ["video", "Videos"]].map(([kind, label]) => <button key={label} type="button" className={draft.kind === kind ? "chip active" : "chip"} onClick={() => applyFilters({ ...draft, kind })}>{label}</button>)}
+      <button type="button" className={draft.review ? "chip active" : "chip"} onClick={() => applyFilters({ ...draft, review: !draft.review })}>Needs review</button>
+    </div>
     <PairTray pair={pair} onCompare={onCompare} />
     {error && <div className="library-error">{error}</div>}
-    <div className="library-meta"><span>{loading ? "Searching Cloudinary…" : error ? "Search did not finish" : `${total || assets.length} matching assets`}</span><small>Search matches tags, file names, places, and the event brief.</small></div>
-    <section className="asset-grid">
-      {assets.map((asset) => <AssetCard key={asset.publicId} asset={asset} pair={pair} onAssign={onAssign} onReviewTag={decide} />)}
-    </section>
-    {!loading && !error && assets.length === 0 && <div className="queue-empty"><strong>No evidence matches this search.</strong><p>Run an intake, or clear a filter. Assets show up here after Cloudinary accepts the upload.</p></div>}
+    <div className="library-meta"><span>{loading ? "Reading saved evidence…" : error ? "Search did not finish" : `${total || assets.length} matching assets`}</span><small>Grouped by capture date. Open an item to inspect it or mark it before or after.</small></div>
+    {groupByDate(assets).map(([label, items]) => <section key={label} className="day-group">
+      <header><p className="eyebrow">{label}</p><span>{items.length}</span></header>
+      <div className="asset-grid">
+        {items.map((asset) => <AssetCard key={asset.publicId} asset={asset} pair={pair} onOpen={() => setSelectedId(asset.publicId)} />)}
+      </div>
+    </section>)}
+    {!loading && !error && assets.length === 0 && <div className="queue-empty"><strong>No evidence matches this search.</strong><p>Run an intake, or clear a filter. Saved uploads appear here.</p></div>}
     {cursor && <button className="outline load-more" onClick={() => load(filters, cursor, true)} disabled={loading}>Load more</button>}
+    {selected && <LibraryViewer asset={selected} pair={pair} onAssign={onAssign} onClose={() => setSelectedId("")} onStep={(direction) => {
+      const next = assets[selectedIndex + direction];
+      if (next) setSelectedId(next.publicId);
+    }} canPrev={selectedIndex > 0} canNext={selectedIndex < assets.length - 1} onReviewTag={decide} />}
   </div>;
 }
 
@@ -471,20 +521,54 @@ function PairTray({ pair, onCompare }) {
   </div>;
 }
 
-function AssetCard({ asset, pair, onAssign, onReviewTag }) {
+function AssetCard({ asset, pair, onOpen }) {
   const before = pair.before?.publicId === asset.publicId;
   const after = pair.after?.publicId === asset.publicId;
-  return <article className={`asset-card ${asset.needsReview ? "needs-review" : ""} ${before ? "is-before" : ""} ${after ? "is-after" : ""}`}>
-    <div className="asset-thumb">{asset.resourceType === "video" ? <video src={asset.secureUrl} poster={asset.previewUrl} muted /> : <img src={asset.previewUrl || asset.secureUrl} alt="" />}<span>{before ? "Before" : after ? "After" : asset.resourceType}</span></div>
+  const label = before ? "Before" : after ? "After" : asset.resourceType === "video" ? "Video" : "Photo";
+  return <button type="button" className={`asset-card ${asset.needsReview ? "needs-review" : ""} ${before ? "is-before" : ""} ${after ? "is-after" : ""}`} onClick={onOpen}>
+    <div className="asset-thumb">{asset.resourceType === "video" ? <img src={asset.previewUrl || asset.secureUrl} alt="" /> : <img src={asset.previewUrl || asset.secureUrl} alt="" />}<span>{label}</span></div>
     <div className="asset-copy">
-      <strong>{asset.originalFilename || asset.event || asset.publicId.split("/").pop()}</strong>
+      <strong>{assetTitle(asset)}</strong>
       <small>{formatPlace(asset.location)}</small>
       <small>{formatWhen(asset.date)}</small>
-      <div className="review-tags">{(asset.tags || []).slice(0, 4).map((tag) => <span key={tag}>#{tag}</span>)}</div>
-      {!!asset.suggestions?.length && <div className="suggest-row">{asset.suggestions.map((signal) => <span key={signal.tag} className="suggest-chip"><b>{signal.tag}</b><em>{signal.confidence == null ? "" : `${Math.round(signal.confidence * 100)}%`}</em><button onClick={() => onReviewTag(asset, signal, "accept")}>Keep</button><button onClick={() => onReviewTag(asset, signal, "dismiss")}>Skip</button></span>)}</div>}
-      <div className="pair-actions"><button className={before ? "outline complete" : "outline"} onClick={() => onAssign("before", asset)}>Before</button><button className={after ? "outline complete" : "outline"} onClick={() => onAssign("after", asset)}>After</button></div>
     </div>
-  </article>;
+  </button>;
+}
+
+function LibraryViewer({ asset, pair, onAssign, onClose, onStep, canPrev, canNext, onReviewTag }) {
+  const before = pair.before?.publicId === asset.publicId;
+  const after = pair.after?.publicId === asset.publicId;
+  useEffect(() => {
+    function onKey(event) {
+      if (event.key === "Escape") onClose();
+      if (event.key === "ArrowLeft" && canPrev) onStep(-1);
+      if (event.key === "ArrowRight" && canNext) onStep(1);
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose, onStep, canPrev, canNext]);
+
+  return <div className="viewer" role="dialog" aria-modal="true" aria-label={assetTitle(asset)}>
+    <button className="viewer-backdrop" aria-label="Close" onClick={onClose}></button>
+    <div className="viewer-panel">
+      <div className="viewer-stage">
+        {asset.resourceType === "video" ? <video src={asset.secureUrl} poster={asset.previewUrl} controls autoPlay /> : <img src={asset.secureUrl || asset.previewUrl} alt={assetTitle(asset)} />}
+        <button className="viewer-nav prev" disabled={!canPrev} onClick={() => onStep(-1)} aria-label="Previous">←</button>
+        <button className="viewer-nav next" disabled={!canNext} onClick={() => onStep(1)} aria-label="Next">→</button>
+      </div>
+      <aside>
+        <button className="viewer-close" onClick={onClose} aria-label="Close viewer">×</button>
+        <p className="eyebrow">{asset.resourceType === "video" ? "VIDEO" : "PHOTO"}</p>
+        <h2>{assetTitle(asset)}</h2>
+        <p>{formatPlace(asset.location)}</p>
+        <p>{formatWhen(asset.date)}</p>
+        {asset.event && <p className="viewer-event">{asset.event}</p>}
+        <div className="review-tags">{(asset.tags || []).map((tag) => <span key={tag}>#{tag}</span>)}</div>
+        {!!asset.suggestions?.length && <div className="suggest-row">{asset.suggestions.map((signal) => <span key={signal.tag} className="suggest-chip"><b>{signal.tag}</b><em>{signal.confidence == null ? "" : `${Math.round(signal.confidence * 100)}%`}</em><button onClick={() => onReviewTag(asset, signal, "accept")}>Keep</button><button onClick={() => onReviewTag(asset, signal, "dismiss")}>Skip</button></span>)}</div>}
+        <div className="pair-actions"><button className={before ? "outline complete" : "outline"} onClick={() => onAssign("before", asset)}>Use as before</button><button className={after ? "outline complete" : "outline"} onClick={() => onAssign("after", asset)}>Use as after</button></div>
+      </aside>
+    </div>
+  </div>;
 }
 
 function CompareView({ pair, onLibrary }) {

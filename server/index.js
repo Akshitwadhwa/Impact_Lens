@@ -2,6 +2,7 @@ import "dotenv/config";
 import express from "express";
 import multer from "multer";
 import { v2 as cloudinary } from "cloudinary";
+import { createEvent, findOrCreateEvent, getAsset, listAssets, listProjects, saveAsset, updateAssetReview } from "./db.js";
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -27,7 +28,6 @@ const upload = multer({
 
 const APPLIED_CONFIDENCE = 0.72;
 const UNCERTAIN_CONFIDENCE = 0.4;
-const STOP_WORDS = new Set(["the", "and", "for", "with", "from", "that", "this", "near", "into", "over", "under"]);
 
 app.use(express.json());
 
@@ -185,38 +185,14 @@ function taggingUnavailable(error) {
   return message.includes("categor") || message.includes("add-on") || message.includes("addon") || message.includes("google") || message.includes("not allowed");
 }
 
-function quoteSearch(value) {
-  const clean = String(value || "").replace(/["\\]/g, "").trim().slice(0, 80);
-  return clean ? `"${clean}"` : "";
-}
+app.post("/api/events", (request, response) => {
+  const id = createEvent(request.body || {});
+  response.status(201).json({ id });
+});
 
-function tokenizeQuery(query) {
-  return String(query || "")
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter((token) => token.length > 2 && !STOP_WORDS.has(token))
-    .slice(0, 6);
-}
-
-function buildExpression(query) {
-  const parts = ["tags=impactlens"];
-  if (query.project) parts.push(`tags=project-${cleanSegment(query.project)}`);
-  const tag = quoteSearch(query.tag);
-  if (tag) parts.push(`tags=${tag}`);
-  if (query.review === "1" || query.review === "true") parts.push("tags=needs-review");
-  if (query.from && !Number.isNaN(new Date(query.from).getTime())) {
-    parts.push(`created_at>=${new Date(query.from).toISOString()}`);
-  }
-  if (query.to && !Number.isNaN(new Date(query.to).getTime())) {
-    parts.push(`created_at<=${new Date(`${query.to}T23:59:59`).toISOString()}`);
-  }
-  const tokens = tokenizeQuery(query.q);
-  if (tokens.length) {
-    const clauses = tokens.map((token) => `(tags:${token}* OR filename:${token}* OR context.event_name:${token}* OR context.event_location:${token}* OR context.evidence_goal:${token}* OR context.folder_brief:${token}*)`);
-    parts.push(`(${clauses.join(" OR ")})`);
-  }
-  return parts.join(" AND ");
-}
+app.get("/api/projects", (_request, response) => {
+  response.json({ projects: listProjects() });
+});
 
 app.post("/api/upload", upload.array("files", 1000), async (request, response) => {
   if (!cloudinaryReady) {
@@ -230,6 +206,7 @@ app.post("/api/upload", upload.array("files", 1000), async (request, response) =
 
   const profile = JSON.parse(request.body.profile || "{}");
   const folderBrief = request.body.folderBrief || "";
+  const eventId = Number(request.body.eventId) || createEvent(profile);
   const project = cleanSegment(profile.projectName || "impact-project");
   const event = cleanSegment(profile.eventName || "unassigned-event");
   const sourceFolder = cleanSegment(request.body.sourceFolder || "import");
@@ -283,43 +260,28 @@ app.post("/api/upload", upload.array("files", 1000), async (request, response) =
         result.context = { ...(result.context || {}), suggested_tags: suggestedTags };
       }
 
-      results.push(shapeAsset(result, {
+      const asset = shapeAsset(result, {
         originalFilename: file.originalname,
         signals,
         suggestedTags,
         taggingStatus: signals.length ? "ready" : taggingStatus
-      }));
+      });
+      saveAsset(eventId, asset, request.body.sourceFolder || "");
+      results.push(asset);
     }
-    response.json({ uploaded: results.length, taggingStatus, assets: results });
+    response.json({ uploaded: results.length, taggingStatus, eventId, assets: results });
   } catch (error) {
     console.error("Cloudinary upload failed:", error);
     response.status(502).json({ error: error.message || "Cloudinary upload failed." });
   }
 });
 
-app.get("/api/library", async (request, response) => {
-  if (!cloudinaryReady) {
-    return response.status(503).json({ error: "Cloudinary is not configured. Add the three CLOUDINARY_* values to .env." });
-  }
-
+app.get("/api/library", (request, response) => {
   try {
-    let search = cloudinary.search
-      .expression(buildExpression(request.query))
-      .sort_by("created_at", "desc")
-      .with_field("context")
-      .with_field("tags")
-      .with_field("image_metadata")
-      .max_results(30);
-    if (request.query.cursor) search = search.next_cursor(String(request.query.cursor));
-    const result = await search.execute();
-    response.json({
-      total: result.total_count || 0,
-      nextCursor: result.next_cursor || "",
-      assets: (result.resources || []).map((resource) => shapeAsset(resource))
-    });
+    response.json(listAssets(request.query));
   } catch (error) {
-    console.error("Cloudinary search failed:", error);
-    response.status(502).json({ error: error?.error?.message || error.message || "Media search failed." });
+    console.error("Library query failed:", error);
+    response.status(500).json({ error: "Could not read the evidence library." });
   }
 });
 
@@ -351,6 +313,11 @@ app.post("/api/assets/tags", async (request, response) => {
       await cloudinary.uploader.add_context({ suggested_tags: "" }, [publicId], { resource_type: resourceType });
       await cloudinary.uploader.remove_tag("needs-review", [publicId], { resource_type: resourceType });
     }
+
+    const stored = getAsset(publicId);
+    const tags = stored ? JSON.parse(stored.tags || "[]") : [];
+    const nextTags = action === "accept" ? [...new Set([...tags, tag])] : tags;
+    updateAssetReview(publicId, { tags: nextTags, suggestedTags });
 
     response.json({ ok: true, suggestedTags, action, tag });
   } catch (error) {
@@ -388,7 +355,42 @@ app.post("/api/compare", (request, response) => {
   }
 });
 
+async function importCloudinaryLibrary() {
+  if (!cloudinaryReady) return;
+  let cursor = "";
+  let imported = 0;
+  do {
+    let search = cloudinary.search
+      .expression("tags=impactlens")
+      .sort_by("created_at", "desc")
+      .with_field("context")
+      .with_field("tags")
+      .with_field("image_metadata")
+      .max_results(50);
+    if (cursor) search = search.next_cursor(cursor);
+    const result = await search.execute();
+    for (const resource of result.resources || []) {
+      const asset = shapeAsset(resource);
+      const eventId = findOrCreateEvent({
+        projectName: asset.project || "Impact project",
+        eventName: asset.event || "Unassigned event",
+        location: asset.location || "",
+        date: asset.date || "",
+        goal: ""
+      });
+      const parts = String(asset.publicId || "").split("/");
+      saveAsset(eventId, asset, parts.length > 3 ? parts[parts.length - 2] : "");
+      imported += 1;
+    }
+    cursor = result.next_cursor || "";
+  } while (cursor);
+  if (imported) console.log(`Saved ${imported} Cloudinary assets in SQLite.`);
+}
+
 app.listen(port, () => {
   console.log(`ImpactLens API listening on http://localhost:${port}`);
   console.log(cloudinaryReady ? "Cloudinary upload mode is ready." : "Cloudinary credentials are not configured.");
+  importCloudinaryLibrary().catch((error) => {
+    console.error("Could not copy existing Cloudinary assets into SQLite:", error?.error?.message || error.message);
+  });
 });
