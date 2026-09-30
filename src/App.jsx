@@ -72,6 +72,17 @@ function assetTitle(asset) {
   return asset.originalFilename;
 }
 
+function resultLine(prompt) {
+  const phrase = String(prompt || "")
+    .replace(/[.?!]+$/g, "")
+    .replace(/^(ok[, ]+|please\s+|show\s+me\s+|find\s+|get\s+|give\s+me\s+)/i, "")
+    .replace(/^(some|the)\s+/i, "")
+    .replace(/\s+for\s+(an?\s+)?(instagram|insta)(\s+\w+){0,2}$/i, "")
+    .trim();
+  const subject = phrase || "photos";
+  return `These are your ${subject.charAt(0).toLowerCase()}${subject.slice(1)}.`;
+}
+
 function groupByDate(assets) {
   const groups = new Map();
   assets.forEach((asset) => {
@@ -107,6 +118,8 @@ function App() {
   const [profile, setProfile] = useState(null);
   const [folders, setFolders] = useState([]);
   const [cloudinaryReady, setCloudinaryReady] = useState(false);
+  const [aiReady, setAiReady] = useState(false);
+  const [readingBrief, setReadingBrief] = useState(false);
   const [notice, setNotice] = useState("");
   const [intakeState, setIntakeState] = useState("idle");
   const [intakeResult, setIntakeResult] = useState(null);
@@ -118,8 +131,14 @@ function App() {
   useEffect(() => {
     fetch("/api/status")
       .then((response) => response.json())
-      .then((data) => setCloudinaryReady(Boolean(data.cloudinaryReady)))
-      .catch(() => setCloudinaryReady(false));
+      .then((data) => {
+        setCloudinaryReady(Boolean(data.cloudinaryReady));
+        setAiReady(Boolean(data.aiReady));
+      })
+      .catch(() => {
+        setCloudinaryReady(false);
+        setAiReady(false);
+      });
   }, []);
 
   useEffect(() => {
@@ -145,13 +164,31 @@ function App() {
     [projects]
   );
 
-  function createProfile() {
+  async function createProfile() {
+    if (readingBrief) return;
     if (!brief.trim()) {
       setNotice("Describe the event first so we can create an evidence plan.");
       return;
     }
-    setProfile(inferProfile(brief));
-    setNotice("Event profile created. Review it, then add your hard-drive folders.");
+    setReadingBrief(true);
+    try {
+      const response = await fetch("/api/interpret", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: brief })
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not read that brief.");
+      setProfile(data.profile);
+      setNotice(data.profile?.source === "openai"
+        ? "ChatGPT read the brief and filled the event plan."
+        : "Event plan saved from the brief. Add OPENAI_API_KEY in .env to let ChatGPT read it.");
+    } catch (error) {
+      setProfile(inferProfile(brief));
+      setNotice(error.message);
+    } finally {
+      setReadingBrief(false);
+    }
   }
 
   function onFolderSelect(event) {
@@ -282,6 +319,7 @@ function App() {
         </nav>
         <div className="sidebar-bottom">
           <div className="cloud-status"><span className={cloudinaryReady ? "status-dot online" : "status-dot"}></span>{cloudinaryReady ? "Cloudinary connected" : "Cloudinary setup required"}</div>
+          <div className="cloud-status"><span className={aiReady ? "status-dot online" : "status-dot"}></span>{aiReady ? "ChatGPT connected" : "ChatGPT key needed"}</div>
           <button className="help-link">? Help center</button>
           <div className="user-card"><span className="avatar">YOU</span><div><strong>Your workspace</strong><small>Impact team</small></div><span>⌄</span></div>
         </div>
@@ -300,7 +338,7 @@ function App() {
         ) : screen === "review" ? (
           <EvidenceWorkspace result={intakeResult} folders={folders} assets={reviewAssets} onDashboard={addProjectToDashboard} onLibrary={() => setScreen("library")} onCompare={() => setScreen("compare")} onAssign={assignPair} onReviewTag={reviewTag} />
         ) : screen === "library" ? (
-          <MediaLibrary key={libraryProject || "all"} projectName={libraryProject} pair={pair} onAssign={assignPair} onCompare={() => setScreen("compare")} onReviewTag={reviewTag} onNotice={setNotice} />
+          <MediaLibrary key={libraryProject || "all"} projectName={libraryProject} aiReady={aiReady} pair={pair} onAssign={assignPair} onCompare={() => setScreen("compare")} onReviewTag={reviewTag} onNotice={setNotice} />
         ) : screen === "compare" ? (
           <CompareView pair={pair} onLibrary={() => setScreen("library")} />
         ) : (
@@ -309,6 +347,8 @@ function App() {
             setBrief={setBrief}
             profile={profile}
             createProfile={createProfile}
+            readingBrief={readingBrief}
+            aiReady={aiReady}
             folders={folders}
             inputRef={inputRef}
             onFolderSelect={onFolderSelect}
@@ -349,16 +389,16 @@ function ProjectCard({ project, onOpen }) {
   </article>;
 }
 
-function Intake({ brief, setBrief, profile, createProfile, folders, inputRef, onFolderSelect, cloudinaryReady, intakeState, startIntake }) {
+function Intake({ brief, setBrief, profile, createProfile, readingBrief, aiReady, folders, inputRef, onFolderSelect, cloudinaryReady, intakeState, startIntake }) {
   return <div className="intake fade-in">
     <section className="intake-intro"><p className="eyebrow">NEW EVIDENCE INTAKE</p><h2>Start with the story. We’ll handle the evidence.</h2><p>Describe the event once, then add the folders you received from the field.</p></section>
     <section className="intake-conversation">
       <div className="assistant-orb">✦</div>
       <div className="assistant-message"><strong>What should I look for?</strong><span>Include the activity, location, date, people, and the proof you need for your report.</span></div>
-      <div className="chat-composer"><textarea value={brief} onChange={(event) => setBrief(event.target.value)} placeholder="Describe the activity, location, date, participants, and evidence goals…" /><button className="send-button" onClick={createProfile} aria-label="Create event plan">↑</button></div>
+      <div className="chat-composer"><textarea value={brief} onChange={(event) => setBrief(event.target.value)} placeholder="Describe the activity, location, date, participants, and evidence goals…" /><button className="send-button" onClick={createProfile} disabled={readingBrief} aria-label="Create event plan">{readingBrief ? "…" : "↑"}</button></div>
     </section>
     <section className={`plan-bar ${profile ? "ready" : ""}`}>
-      {profile ? <><div className="plan-status"><span>✓</span><div><small>EVENT PLAN READY</small><strong>{profile.eventName} <i>·</i> {profile.location}</strong></div></div><div className="plan-signals">{profile.tags.slice(0, 3).map((tag) => <span key={tag}>#{tag}</span>)}</div></> : <><span className="plan-spark">✦</span><p>Your AI event plan will appear here — ready to guide tagging, location matching, and evidence discovery.</p></>}
+      {profile ? <><div className="plan-status"><span>✓</span><div><small>{profile.source === "openai" ? "CHATGPT PLAN" : "EVENT PLAN READY"}</small><strong>{profile.eventName} <i>·</i> {formatPlace(profile.location)}</strong>{profile.summary && <p className="plan-summary">{profile.summary}</p>}</div></div><div className="plan-signals">{(profile.tags || []).slice(0, 3).map((tag) => <span key={tag}>#{tag}</span>)}</div></> : <><span className="plan-spark">✦</span><p>{aiReady ? "ChatGPT will turn this brief into a project, place, and date." : "Add OPENAI_API_KEY in .env and ChatGPT will read the brief. Until then, the first sentence becomes the project name."}</p></>}
     </section>
     <section className={`upload-stage ${profile ? "unlocked" : "locked"}`}>
       <input ref={inputRef} type="file" multiple webkitdirectory="" directory="" onChange={onFolderSelect} hidden />
@@ -420,7 +460,7 @@ function SuggestionCard({ asset, onAssign, onReviewTag }) {
   </article>;
 }
 
-function MediaLibrary({ projectName = "", pair, onAssign, onCompare, onReviewTag, onNotice }) {
+function MediaLibrary({ projectName = "", aiReady, pair, onAssign, onCompare, onReviewTag, onNotice }) {
   const [filters, setFilters] = useState({ q: "", project: projectName, tag: "", from: "", to: "", review: false, kind: "" });
   const [draft, setDraft] = useState(filters);
   const [assets, setAssets] = useState([]);
@@ -429,6 +469,9 @@ function MediaLibrary({ projectName = "", pair, onAssign, onCompare, onReviewTag
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [selectedId, setSelectedId] = useState("");
+  const [askText, setAskText] = useState("");
+  const [askState, setAskState] = useState("");
+  const [askAnswer, setAskAnswer] = useState("");
 
   const load = useMemo(() => async (nextFilters, nextCursor = "", append = false) => {
     setLoading(true);
@@ -483,7 +526,65 @@ function MediaLibrary({ projectName = "", pair, onAssign, onCompare, onReviewTag
     }
   }
 
+  async function labelPhotos() {
+    if (!projectName) {
+      onNotice("Open a project from the dashboard, then label its photos.");
+      return;
+    }
+    setAskState("labeling");
+    try {
+      const response = await fetch("/api/ai/label", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project: projectName })
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not label photos.");
+      setAskAnswer(data.labeled ? `ChatGPT labeled ${data.labeled} photo${data.labeled === 1 ? "" : "s"}.` : "Those photos already have labels.");
+      await load(filters);
+    } catch (reason) {
+      onNotice(reason.message);
+    } finally {
+      setAskState("");
+    }
+  }
+
+  async function askProject(event) {
+    event.preventDefault();
+    if (!projectName) {
+      onNotice("Open a project from the dashboard, then ask for photos in that project.");
+      return;
+    }
+    setAskState("asking");
+    setAskAnswer("");
+    try {
+      const response = await fetch("/api/ai/ask", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project: projectName, prompt: askText })
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not answer that request.");
+      const found = data.assets || [];
+      setAssets(found);
+      setTotal(found.length);
+      setCursor("");
+      setAskAnswer(found.length ? resultLine(askText) : (data.answer || ""));
+    } catch (reason) {
+      onNotice(reason.message);
+    } finally {
+      setAskState("");
+    }
+  }
+
   return <div className="library fade-in">
+    <form className="ask-bar" onSubmit={askProject}>
+      <label>Ask this project<textarea value={askText} onChange={(event) => setAskText(event.target.value)} placeholder="Low-light photos, wide shots, or an Instagram set for the campaign" /></label>
+      <button className="primary" type="submit" disabled={askState === "asking" || !projectName}>{askState === "asking" ? "Looking…" : "Ask"}</button>
+      <button className="outline" type="button" disabled={!aiReady || askState === "labeling" || !projectName} onClick={labelPhotos}>{askState === "labeling" ? "Reading photos…" : "Label photos"}</button>
+    </form>
+    {askAnswer && <p className="ask-answer">{askAnswer}</p>}
+    {assets.some((asset) => asset.instagram) && <div className="ig-grid">{assets.filter((asset) => asset.instagram).slice(0, 4).map((asset) => <a key={asset.publicId} href={asset.instagram.post} target="_blank" rel="noreferrer"><img src={asset.instagram.post} alt="" /><span>Instagram post</span></a>)}</div>}
     <form className="library-toolbar" onSubmit={search}>
       <label className="search-field">Search<input value={draft.q} onChange={(event) => setDraft({ ...draft, q: event.target.value })} placeholder="place, tag, or file name" /></label>
       <label>Project<input value={draft.project} onChange={(event) => setDraft({ ...draft, project: event.target.value })} placeholder="Project name" /></label>
@@ -504,7 +605,7 @@ function MediaLibrary({ projectName = "", pair, onAssign, onCompare, onReviewTag
         {items.map((asset) => <AssetCard key={asset.publicId} asset={asset} pair={pair} onOpen={() => setSelectedId(asset.publicId)} />)}
       </div>
     </section>)}
-    {!loading && !error && assets.length === 0 && <div className="queue-empty"><strong>No evidence matches this search.</strong><p>Run an intake, or clear a filter. Saved uploads appear here.</p></div>}
+    {!loading && !error && assets.length === 0 && <div className="queue-empty"><strong>{askAnswer ? "Nothing matched that request yet." : "No evidence matches this search."}</strong><p>{askAnswer ? "Label the project photos, then ask again. Search brings the full library back." : "Run an intake, or clear a filter. Saved uploads appear here."}</p></div>}
     {cursor && <button className="outline load-more" onClick={() => load(filters, cursor, true)} disabled={loading}>Load more</button>}
     {selected && <LibraryViewer asset={selected} pair={pair} onAssign={onAssign} onClose={() => setSelectedId("")} onStep={(direction) => {
       const next = assets[selectedIndex + direction];
@@ -531,6 +632,7 @@ function AssetCard({ asset, pair, onOpen }) {
       <strong>{assetTitle(asset)}</strong>
       <small>{formatPlace(asset.location)}</small>
       <small>{formatWhen(asset.date)}</small>
+      {(asset.shot || asset.light) && <small>{[asset.shot, asset.light].filter((item) => item && item !== "unknown").join(" · ")}</small>}
     </div>
   </button>;
 }
@@ -562,6 +664,7 @@ function LibraryViewer({ asset, pair, onAssign, onClose, onStep, canPrev, canNex
         <h2>{assetTitle(asset)}</h2>
         <p>{formatPlace(asset.location)}</p>
         <p>{formatWhen(asset.date)}</p>
+        {asset.caption && <p>{asset.caption}</p>}
         {asset.event && <p className="viewer-event">{asset.event}</p>}
         <div className="review-tags">{(asset.tags || []).map((tag) => <span key={tag}>#{tag}</span>)}</div>
         {!!asset.suggestions?.length && <div className="suggest-row">{asset.suggestions.map((signal) => <span key={signal.tag} className="suggest-chip"><b>{signal.tag}</b><em>{signal.confidence == null ? "" : `${Math.round(signal.confidence * 100)}%`}</em><button onClick={() => onReviewTag(asset, signal, "accept")}>Keep</button><button onClick={() => onReviewTag(asset, signal, "dismiss")}>Skip</button></span>)}</div>}

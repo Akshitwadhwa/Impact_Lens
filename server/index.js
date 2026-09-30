@@ -2,7 +2,8 @@ import "dotenv/config";
 import express from "express";
 import multer from "multer";
 import { v2 as cloudinary } from "cloudinary";
-import { createEvent, findOrCreateEvent, getAsset, listAssets, listProjects, saveAsset, updateAssetReview } from "./db.js";
+import { aiReady, describePhoto, interpretBrief, planAsk } from "./ai.js";
+import { createEvent, findOrCreateEvent, getAsset, listAssets, listProjectAssets, listProjects, saveAsset, updateAssetInsight, updateAssetReview } from "./db.js";
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -28,8 +29,28 @@ const upload = multer({
 
 const APPLIED_CONFIDENCE = 0.72;
 const UNCERTAIN_CONFIDENCE = 0.4;
+const VISION_LIMIT = 10;
+const visionCounts = new Map();
 
 app.use(express.json());
+
+let libraryReady = null;
+function ensureLibrary() {
+  if (!libraryReady) {
+    libraryReady = importCloudinaryLibrary().catch((error) => {
+      libraryReady = null;
+      console.error("Could not copy existing Cloudinary assets into SQLite:", error?.error?.message || error.message);
+    });
+  }
+  return libraryReady;
+}
+
+if (process.env.VERCEL) {
+  app.use(async (_request, _response, next) => {
+    await ensureLibrary();
+    next();
+  });
+}
 
 let statusCache = null;
 let statusCheckedAt = 0;
@@ -37,19 +58,20 @@ let statusCheckedAt = 0;
 app.get("/api/status", async (_request, response) => {
   const autoTagging = process.env.ENABLE_AUTO_TAGGING === "true";
   if (!cloudinaryReady) {
-    return response.json({ cloudinaryReady: false, autoTagging });
+    return response.json({ cloudinaryReady: false, autoTagging, aiReady: aiReady() });
   }
   if (statusCache && Date.now() - statusCheckedAt < 20000) {
     return response.json(statusCache);
   }
   try {
     await cloudinary.api.ping();
-    statusCache = { cloudinaryReady: true, autoTagging };
+    statusCache = { cloudinaryReady: true, autoTagging, aiReady: aiReady() };
   } catch (error) {
     const message = error?.error?.message || error.message || "Cloudinary rejected these credentials.";
     statusCache = {
       cloudinaryReady: false,
       autoTagging,
+      aiReady: aiReady(),
       error: /cloud_name mismatch/i.test(message)
         ? "Cloudinary rejected the cloud name. Copy it again from the console, with no spaces."
         : message
@@ -169,6 +191,52 @@ function shapeAsset(result, extras = {}) {
   };
 }
 
+function applyReading(asset, reading) {
+  const confident = reading.confidence >= 0.6;
+  const applied = confident ? reading.tags : [];
+  const suggested = confident ? [] : reading.tags.map((tag) => `${tag}:${reading.confidence.toFixed(2)}`);
+  const suggestedTags = [asset.suggestedTags, ...suggested].filter(Boolean).join("|");
+  return {
+    ...asset,
+    caption: reading.caption,
+    shot: reading.shot,
+    light: reading.light,
+    role: reading.role,
+    tags: [...new Set([...(asset.tags || []), ...applied])],
+    suggestedTags,
+    suggestions: String(suggestedTags).split("|").filter(Boolean).map((part) => {
+      const [tag, confidence] = part.split(":");
+      const score = Number(confidence);
+      return { tag, confidence: Number.isFinite(score) ? score : null, status: "uncertain" };
+    }),
+    needsReview: asset.needsReview || Boolean(suggestedTags)
+  };
+}
+
+async function labelPhoto(asset) {
+  const preview = asset.previewUrl || asset.secureUrl;
+  if (!preview) return null;
+  const reading = await describePhoto(preview);
+  const labeled = applyReading(asset, reading);
+  if (reading.confidence >= 0.6 && reading.tags.length && cloudinaryReady) {
+    await cloudinary.uploader.add_tag(reading.tags, [asset.publicId], { resource_type: "image" });
+  }
+  updateAssetInsight(asset.publicId, labeled);
+  return labeled;
+}
+
+function instagramSet(publicId, brighten) {
+  const sized = (width, height) => cloudinary.url(publicId, {
+    resource_type: "image",
+    secure: true,
+    transformation: [
+      ...(brighten ? [{ effect: "improve" }] : []),
+      { width, height, crop: "fill", gravity: "auto", quality: "auto", fetch_format: "jpg" }
+    ]
+  });
+  return { post: sized(1080, 1350), square: sized(1080, 1080), story: sized(1080, 1920) };
+}
+
 function uploadToCloudinary(file, options) {
   return new Promise((resolve, reject) => {
     cloudinary.uploader
@@ -184,6 +252,70 @@ function taggingUnavailable(error) {
   const message = `${error?.message || ""} ${error?.error?.message || ""}`.toLowerCase();
   return message.includes("categor") || message.includes("add-on") || message.includes("addon") || message.includes("google") || message.includes("not allowed");
 }
+
+app.post("/api/interpret", async (request, response) => {
+  try {
+    const profile = await interpretBrief(request.body?.prompt || "");
+    response.json({ profile });
+  } catch (error) {
+    response.status(400).json({ error: error.message || "Could not read that brief." });
+  }
+});
+
+app.post("/api/ai/label", async (request, response) => {
+  if (!aiReady()) return response.status(503).json({ error: "Add OPENAI_API_KEY to .env to label photos." });
+  const project = String(request.body?.project || "").trim();
+  if (!project) return response.status(400).json({ error: "Open a project before labeling photos." });
+
+  try {
+    const photos = listProjectAssets(project, { images: true, unlabeled: true, limit: VISION_LIMIT });
+    const assets = [];
+    for (const photo of photos) {
+      const labeled = await labelPhoto(photo);
+      if (labeled) assets.push(labeled);
+    }
+    response.json({ labeled: assets.length, assets });
+  } catch (error) {
+    console.error("Photo labeling failed:", error);
+    response.status(502).json({ error: error.message || "Could not label those photos." });
+  }
+});
+
+app.post("/api/ai/ask", async (request, response) => {
+  const project = String(request.body?.project || "").trim();
+  const prompt = String(request.body?.prompt || "").trim();
+  if (!project) return response.status(400).json({ error: "Open a project before asking for photos." });
+
+  try {
+    const catalog = listProjectAssets(project, { limit: 40 });
+    const plan = await planAsk(prompt, catalog);
+    let chosen = catalog.filter((asset) => plan.publicIds.includes(asset.publicId));
+    if (!chosen.length) {
+      chosen = catalog.filter((asset) => {
+        if (plan.shot && asset.shot !== plan.shot) return false;
+        if (plan.light && asset.light !== plan.light) return false;
+        if (plan.role && asset.role !== plan.role) return false;
+        return Boolean(plan.shot || plan.light || plan.role);
+      });
+    }
+    if (!chosen.length && (plan.shot || plan.light || plan.role) && !catalog.some((asset) => asset.caption || asset.shot || asset.light)) {
+      return response.json({
+        answer: "Label this project's photos first. Then ask again for low light, a shot type, or an Instagram set.",
+        source: plan.source,
+        instagram: false,
+        assets: []
+      });
+    }
+    if (!chosen.length) chosen = catalog.slice(0, 8);
+    const assets = chosen.slice(0, 8).map((asset) => (
+      plan.instagram && asset.resourceType === "image" ? { ...asset, instagram: instagramSet(asset.publicId, plan.brighten || asset.light === "low") } : asset
+    ));
+    response.json({ answer: plan.answer, source: plan.source, instagram: plan.instagram, assets });
+  } catch (error) {
+    console.error("Project ask failed:", error);
+    response.status(502).json({ error: error.message || "Could not answer that request." });
+  }
+});
 
 app.post("/api/events", (request, response) => {
   const id = createEvent(request.body || {});
@@ -222,6 +354,7 @@ app.post("/api/upload", upload.array("files", 1000), async (request, response) =
 
   try {
     const results = [];
+    let visionBudget = visionCounts.get(eventId) || 0;
     let taggingStatus = process.env.ENABLE_AUTO_TAGGING === "true" ? "ready" : "disabled";
     for (const file of files) {
       const resourceType = file.mimetype.startsWith("video/") ? "video" : "image";
@@ -266,9 +399,22 @@ app.post("/api/upload", upload.array("files", 1000), async (request, response) =
         suggestedTags,
         taggingStatus: signals.length ? "ready" : taggingStatus
       });
-      saveAsset(eventId, asset, request.body.sourceFolder || "");
-      results.push(asset);
+      let stored = asset;
+      if (aiReady() && resourceType === "image" && visionBudget < VISION_LIMIT) {
+        try {
+          const labeled = await labelPhoto(asset);
+          if (labeled) {
+            stored = labeled;
+            visionBudget += 1;
+          }
+        } catch (error) {
+          console.error("OpenAI vision failed:", error.message);
+        }
+      }
+      saveAsset(eventId, stored, request.body.sourceFolder || "");
+      results.push(stored);
     }
+    visionCounts.set(eventId, visionBudget);
     response.json({ uploaded: results.length, taggingStatus, eventId, assets: results });
   } catch (error) {
     console.error("Cloudinary upload failed:", error);
@@ -387,10 +533,12 @@ async function importCloudinaryLibrary() {
   if (imported) console.log(`Saved ${imported} Cloudinary assets in SQLite.`);
 }
 
-app.listen(port, () => {
-  console.log(`ImpactLens API listening on http://localhost:${port}`);
-  console.log(cloudinaryReady ? "Cloudinary upload mode is ready." : "Cloudinary credentials are not configured.");
-  importCloudinaryLibrary().catch((error) => {
-    console.error("Could not copy existing Cloudinary assets into SQLite:", error?.error?.message || error.message);
+if (!process.env.VERCEL) {
+  app.listen(port, () => {
+    console.log(`ImpactLens API listening on http://localhost:${port}`);
+    console.log(cloudinaryReady ? "Cloudinary upload mode is ready." : "Cloudinary credentials are not configured.");
+    ensureLibrary();
   });
-});
+}
+
+export default app;

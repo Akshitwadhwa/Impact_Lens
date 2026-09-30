@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 
-const dataDir = path.resolve("data");
+const dataDir = process.env.VERCEL ? "/tmp" : path.resolve("data");
 mkdirSync(dataDir, { recursive: true });
 
 const db = new DatabaseSync(path.join(dataDir, "impactlens.sqlite"));
@@ -15,6 +15,7 @@ db.exec(`
     location TEXT,
     event_date TEXT,
     evidence_goal TEXT,
+    summary TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
   CREATE TABLE IF NOT EXISTS assets (
@@ -31,9 +32,26 @@ db.exec(`
     tags TEXT NOT NULL DEFAULT '[]',
     suggested_tags TEXT NOT NULL DEFAULT '',
     needs_review INTEGER NOT NULL DEFAULT 0,
+    caption TEXT,
+    shot TEXT,
+    light TEXT,
+    role TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 `);
+
+for (const [table, column, type] of [
+  ["events", "summary", "TEXT"],
+  ["assets", "caption", "TEXT"],
+  ["assets", "shot", "TEXT"],
+  ["assets", "light", "TEXT"],
+  ["assets", "role", "TEXT"]
+]) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (!columns.some((item) => item.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  }
+}
 
 function parseSuggestions(value = "") {
   return String(value)
@@ -62,14 +80,15 @@ export function findOrCreateEvent(profile = {}) {
 
 export function createEvent(profile = {}) {
   const result = db.prepare(`
-    INSERT INTO events (project_name, event_name, location, event_date, evidence_goal)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT INTO events (project_name, event_name, location, event_date, evidence_goal, summary)
+    VALUES (?, ?, ?, ?, ?, ?)
   `).run(
     profile.projectName || "Impact project",
     profile.eventName || "Unassigned event",
     profile.location || "",
     profile.date || "",
-    profile.goal || ""
+    profile.goal || "",
+    profile.summary || ""
   );
   return Number(result.lastInsertRowid);
 }
@@ -78,8 +97,9 @@ export function saveAsset(eventId, asset, sourceFolder) {
   db.prepare(`
     INSERT INTO assets (
       event_id, public_id, secure_url, preview_url, resource_type, source_folder,
-      original_filename, location, captured_at, tags, suggested_tags, needs_review
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      original_filename, location, captured_at, tags, suggested_tags, needs_review,
+      caption, shot, light, role
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(public_id) DO UPDATE SET
       event_id = excluded.event_id,
       secure_url = excluded.secure_url,
@@ -91,7 +111,11 @@ export function saveAsset(eventId, asset, sourceFolder) {
       captured_at = excluded.captured_at,
       tags = excluded.tags,
       suggested_tags = excluded.suggested_tags,
-      needs_review = excluded.needs_review
+      needs_review = excluded.needs_review,
+      caption = CASE WHEN excluded.caption != '' THEN excluded.caption ELSE assets.caption END,
+      shot = CASE WHEN excluded.shot != '' THEN excluded.shot ELSE assets.shot END,
+      light = CASE WHEN excluded.light != '' THEN excluded.light ELSE assets.light END,
+      role = CASE WHEN excluded.role != '' THEN excluded.role ELSE assets.role END
   `).run(
     eventId,
     asset.publicId,
@@ -104,7 +128,28 @@ export function saveAsset(eventId, asset, sourceFolder) {
     asset.date || "",
     JSON.stringify(asset.tags || []),
     asset.suggestedTags || "",
-    asset.needsReview ? 1 : 0
+    asset.needsReview ? 1 : 0,
+    asset.caption || "",
+    asset.shot || "",
+    asset.light || "",
+    asset.role || ""
+  );
+}
+
+export function updateAssetInsight(publicId, insight) {
+  db.prepare(`
+    UPDATE assets
+    SET caption = ?, shot = ?, light = ?, role = ?, tags = ?, suggested_tags = ?, needs_review = ?
+    WHERE public_id = ?
+  `).run(
+    insight.caption || "",
+    insight.shot || "",
+    insight.light || "",
+    insight.role || "",
+    JSON.stringify(insight.tags || []),
+    insight.suggestedTags || "",
+    insight.needsReview ? 1 : 0,
+    publicId
   );
 }
 
@@ -136,8 +181,27 @@ function rowToAsset(row) {
     date: row.captured_at || row.created_at || "",
     suggestedTags,
     suggestions: parseSuggestions(suggestedTags),
-    needsReview: Boolean(row.needs_review)
+    needsReview: Boolean(row.needs_review),
+    caption: row.caption || "",
+    shot: row.shot || "",
+    light: row.light || "",
+    role: row.role || ""
   };
+}
+
+export function listProjectAssets(projectName, { images = false, unlabeled = false, limit = 40 } = {}) {
+  const where = ["e.project_name LIKE ?"];
+  const params = [`%${String(projectName).slice(0, 80)}%`];
+  if (images) where.push("a.resource_type = 'image'");
+  if (unlabeled) where.push("(a.caption IS NULL OR a.caption = '')");
+  return db.prepare(`
+    SELECT a.*, e.project_name, e.event_name
+    FROM assets a
+    JOIN events e ON e.id = a.event_id
+    WHERE ${where.join(" AND ")}
+    ORDER BY a.id DESC
+    LIMIT ?
+  `).all(...params, limit).map(rowToAsset);
 }
 
 export function listAssets(query = {}) {
@@ -170,11 +234,11 @@ export function listAssets(query = {}) {
     .filter((token) => token.length > 2)
     .slice(0, 6);
   if (tokens.length) {
-    const clause = tokens.map(() => "(a.original_filename LIKE ? OR a.tags LIKE ? OR a.location LIKE ? OR a.source_folder LIKE ? OR a.captured_at LIKE ?)").join(" OR ");
+    const clause = tokens.map(() => "(a.original_filename LIKE ? OR a.tags LIKE ? OR a.location LIKE ? OR a.source_folder LIKE ? OR a.captured_at LIKE ? OR a.caption LIKE ? OR a.shot LIKE ? OR a.light LIKE ?)").join(" OR ");
     where.push(`(${clause})`);
     tokens.forEach((token) => {
       const like = `%${token}%`;
-      params.push(like, like, like, like, like);
+      params.push(like, like, like, like, like, like, like, like);
     });
   }
 
